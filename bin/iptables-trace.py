@@ -7,7 +7,7 @@ import signal
 import ctypes
 import struct
 
-import iptc
+import iptc, iptc.ip4tc, iptc.ip6tc
 from libnetfilter.log import nflog_handle
 from libnetfilter.netlink import nf_log
 
@@ -118,74 +118,97 @@ def format_parameters(args):
 			r[k] = " ".join(v)
 	return str(r)
 
-def trace_cb(gh, nfmsg, nfa, data):
-	prefix = nfa.prefix.decode('ascii')
-	if not prefix.startswith('TRACE: '):
+def trace_cb(family):
+	def cb(gh, nfmsg, nfa, data):
+		prefix = nfa.prefix.decode('ascii')
+		if not prefix.startswith('TRACE: '):
+			return 0
+
+		# chainname may have :, therefore split and re-create chainname
+		p = prefix[7:].split(":")
+		tablename,chainname,type,rulenum = [p[0], ':'.join(p[1:-2]), p[-2], p[-1]]
+
+		table = Table(family, tablename)
+		chain = iptc.Chain(table, chainname)
+		pkt = nfa.payload
+
+		if tablename == 'raw' and chainname in ('PREROUTING','OUTPUT'):
+			print(nf_log(pkt, nfa.indev, nfa.outdev))
+
+		r = "\t{} {} ".format(tablename,chainname)
+		if type == 'policy':
+			x = chain.get_policy().name
+			if x == 'ACCEPT':
+				x = bcolors.ok(x)
+			else:
+				x = bcolors.fail(x)
+		elif type == 'rule':
+			r += "(#{r}) ".format(r=rulenum.strip())
+			rule = chain.rules[int(rulenum)-1]
+			x = "{r.protocol} {r.src} -> {r.dst} ".format(r=rule)
+			for m in rule.matches:
+				if m.name == 'comment':
+					r += "/* {} */".format(m.get_all_parameters()['comment'][0])
+				else:
+					x += "{}:{} ".format(m.name, format_parameters(m.get_all_parameters()))
+
+			tp = rule.target.get_all_parameters()
+			if len(tp) > 0:
+				tp = format_parameters(tp)
+			else:
+				tp = ""
+
+			if rule.target.name == 'ACCEPT':
+				targetname = bcolors.ok(rule.target.name)
+			elif rule.target.name in ('REJECT','DROP'):
+				targetname = bcolors.fail(rule.target.name)
+			else:
+				targetname = bcolors.next(rule.target.name)
+			x += "\n\t\t=> {} {}".format(targetname, tp)
+		elif type == 'return':
+			# unconditional rule having the default policy of the calling chain get named "return"
+			# net/ipv4/netfilter/ip_tables.c
+			# get_chainname_rulenum
+			try:
+					r += "(#{r}) ".format(r=rulenum.strip())
+					rule = chain.rules[int(rulenum)-1]
+					if rule.target.name == 'ACCEPT':
+							targetname = bcolors.ok(rule.target.name)
+					elif rule.target.name in ('REJECT','DROP'):
+							targetname = bcolors.fail(rule.target.name)
+					else:
+							targetname = bcolors.next(rule.target.name)
+					x = "=> {}".format(targetname)
+			except Exception as e:
+					x = "return"
+
+		r += "NFMARK=0x{:x} (0x{:x})".format(nfa.nfmark & data, nfa.nfmark)
+
+		print("{}\n\t\t{}".format(r,x))
 		return 0
 
-	# chainname may have :, therefore split and re-create chainname
-	p = prefix[7:].split(":")
-	tablename,chainname,type,rulenum = [p[0], ':'.join(p[1:-2]), p[-2], p[-1]]
+	return cb
 
-	table = iptc.Table(tablename)
-	chain = iptc.Chain(table, chainname)
-	pkt = nfa.payload
 
-	if tablename == 'raw' and chainname in ('PREROUTING','OUTPUT'):
-		print(nf_log(pkt, nfa.indev, nfa.outdev))
+def is_table_available(family, *args, **kwargs):
+	if family == 'ip4':
+		return iptc.ip4tc.is_table_available(*args, **kwargs)
+	elif family == 'ip6':
+		return iptc.ip6tc.is_table6_available(*args, **kwargs)
 
-	r = "\t{} {} ".format(tablename,chainname)
-	if type == 'policy':
-		x = chain.get_policy().name
-		if x == 'ACCEPT':
-			x = bcolors.ok(x)
-		else:
-			x = bcolors.fail(x)
-	elif type == 'rule':
-		r += "(#{r}) ".format(r=rulenum.strip())
-		rule = chain.rules[int(rulenum)-1]
-		x = "{r.protocol} {r.src} -> {r.dst} ".format(r=rule)
-		for m in rule.matches:
-			if m.name == 'comment':
-				r += "/* {} */".format(m.get_all_parameters()['comment'][0])
-			else:
-				x += "{}:{} ".format(m.name, format_parameters(m.get_all_parameters()))
 
-		tp = rule.target.get_all_parameters()
-		if len(tp) > 0:
-			tp = format_parameters(tp)
-		else:
-			tp = ""
+def Table(family, name, autocommit=None):
+	if family == 'ip4':
+		return iptc.ip4tc.Table(name, autocommit=autocommit)
+	elif family == 'ip6':
+		return iptc.ip6tc.Table6(name, autocommit=autocommit)
 
-		if rule.target.name == 'ACCEPT':
-			targetname = bcolors.ok(rule.target.name)
-		elif rule.target.name in ('REJECT','DROP'):
-			targetname = bcolors.fail(rule.target.name)
-		else:
-			targetname = bcolors.next(rule.target.name)
-		x += "\n\t\t=> {} {}".format(targetname, tp)
-	elif type == 'return':
-		# unconditional rule having the default policy of the calling chain get named "return"
-		# net/ipv4/netfilter/ip_tables.c
-		# get_chainname_rulenum
-		try:
-				r += "(#{r}) ".format(r=rulenum.strip())
-				rule = chain.rules[int(rulenum)-1]
-				if rule.target.name == 'ACCEPT':
-						targetname = bcolors.ok(rule.target.name)
-				elif rule.target.name in ('REJECT','DROP'):
-						targetname = bcolors.fail(rule.target.name)
-				else:
-						targetname = bcolors.next(rule.target.name)
-				x = "=> {}".format(targetname)
-		except Exception as e:
-				x = "return"
 
-	r += "NFMARK=0x{:x} (0x{:x})".format(nfa.nfmark & data, nfa.nfmark)
-
-	print("{}\n\t\t{}".format(r,x))
-	return 0
-
+def Rule(family, **kwargs):
+	if family == 'ip4':
+		return iptc.ip4tc.Rule(**kwargs)
+	if family == 'ip6':
+		return iptc.ip6tc.Rule6(**kwargs)
 
 def main():
 	global running
@@ -201,14 +224,18 @@ def main():
 	parser.add_argument('--protocol', '-p', type=str, action='store', default=None, help='protocol')
 	parser.add_argument('--xmark-mask', '-M', type=str, action='store', default="0x800001ff", help='mark mask (bits to use) default is not to use lower 9 bits and the highest')
 	parser.add_argument('--limit', action='store_true', default=False, help="limit rule matches to 1/second")
+	parser.add_argument('--family', '-f', type=str, choices=['ip4', 'ip6'], default='ip4', help="what address family should be traced")
 	parser.add_argument('bpf', type=str, action='store', default='', nargs='*')
 
 	args = parser.parse_args()
 	print(args)
 
-	if not iptc.is_table_available(iptc.Table.RAW):
+	if args.family not in ['ip4', 'ip6']:
+		raise ValueError("Address family %s is not supported." % (args.family))
+
+	if not is_table_available(args.family, iptc.Table.RAW):
 		raise ValueError("table raw does not exist")
-	table = iptc.Table("raw")
+	table = Table(args.family, iptc.Table.RAW)
 
 	rules = []
 	for i in args.chain:
@@ -219,7 +246,7 @@ def main():
 				print("delete rule {}".format(i))
 				chain.delete_rule(i)
 
-		mark = iptc.Rule()
+		mark = Rule(args.family)
 		if args.protocol:
 			mark.protocol = args.protocol
 		if args.source:
@@ -248,20 +275,21 @@ def main():
 		chain.append_rule(mark)
 		rules.append((chain,mark))
 
-		trace = iptc.Rule()
+		trace = Rule(args.family)
 		match = trace.create_match("mark")
 		match.mark = "{}/0x{:x}".format(m,0xffffffff & ~int(args.xmark_mask, 16))
 		trace.target = iptc.Target(trace, "TRACE")
 		chain.append_rule(trace)
 		rules.append((chain,trace))
 
+	af = socket.AF_INET if args.family == 'ip4' else socket.AF_INET6
 	n = nflog_handle.open()
-	r = n.unbind_pf(socket.AF_INET)
-	r = n.bind_pf(socket.AF_INET)
+	r = n.unbind_pf(af)
+	r = n.bind_pf(af)
 	qh = n.bind_group(0)
 	qh.set_mode(0x02, 0xffff)
 
-	qh.callback_register(trace_cb, int(args.xmark_mask, 16));
+	qh.callback_register(trace_cb(args.family), int(args.xmark_mask, 16));
 
 	fd = n.fd
 
